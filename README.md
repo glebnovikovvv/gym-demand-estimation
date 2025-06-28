@@ -38,6 +38,6 @@ The goal was to help businesses make smarter location and pricing decisions usin
 
 ---
 
-📎 `project1_gleb.pdf` — полный текст диссертации  
-📄 `gym_demand_model.Rmd` — скрипт анализа в формате R Markdown  
+📎 `final_gleb_project1` — полный текст диссертации  
+📄 `project1_gleb.Rmd` — скрипт анализа в формате R Markdown  
 📁 `data/` —  примеры данных
