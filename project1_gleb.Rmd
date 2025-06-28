@@ -1,0 +1,1293 @@
+---
+title: "project1_gleb"
+output: pdf_document
+date: "2025-06-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+***Spatially Aware Modelling for Data-Driven Gym Membership Demand Estimation***
+Gleb Novikov 
+
+S2693219 – MSc Statistic with Data Science
+
+University of Edinburgh
+
+
+**Executive summary**
+
+Building a gym represents a substantial investment, and as a highly localized service, location plays a critical role in determining its success. Thus, trying to understand in advance the factors driving future demand, including spatial patterns, is crucial. This project applies modern statistical and spatiotemporal modeling techniques to estimate gym demand in an attempted formal scientific way. Using Bayesian modeling via INLA, we analyze panel data provided by Simon-Kucher to compare a variety of demand estimation models. Our final model, based on the SPDE (Stochastic Partial Differential Equation) approach, outperforms simpler alternatives on key Bayesian model selection criteria such as WAIC and LCPO. However, it underperforms in 10-fold cross-validation, potentially signalizing overfitting.
+
+Key factors associated with increased gym demand include population density and parking availability, while demand is negatively impacted by local competition and the proportion of repeat users, which aligns well with economic and operational intuition. The spatial component of the SPDE model revealed significant within-region heterogeneity: for example, demand was systematically lower than expected in Greater London and higher in areas such as the Southeast England.
+
+Interestingly, once these key variables were controlled for, many others lost statistical and economic significance. This was especially true for pricing variables, whose effects proved unstable or counterintuitive and thus unsuitable for correct price optimization. These findings underscore the limitations of using historical observational data to estimate price elasticity. Instead, we recommend the use of randomized experiments, such as A/B testing, for more credible causal inference in pricing decisions.
+
+
+**Own Work Declaration**
+
+I assure the single-handed composition of this MSc dissertation project only supported by declared resources.
+Edinburgh, 24th July 2025
+
+
+Importing and preparing data:
+```{r}
+df <- read.csv("C:/Users/Admin/Desktop/Edinburgh MSc/.DISSERTATION/Project 1/VERSION1/Uoe_data_all.csv")
+Sys.setenv(LANG = "en")
+Sys.setlocale("LC_TIME", "English")
+Sys.setlocale("LC_TIME", "C")
+options(scipen = 999)
+
+
+#CHANGE GYM NAMES
+unique_gyms <- unique(df$HashedGymPublicName)
+gym_labels <- paste0("Gym", seq_along(unique_gyms))
+id_map <- setNames(gym_labels, unique_gyms)
+df$GymID <- id_map[df$HashedGymPublicName]
+
+# DATE COLUMNS MANIPUATIONS
+df$month_index <- as.numeric(substr(df$StartMonth, 6, 7))
+df$StartMonth <- as.Date(paste0(df$StartMonth, "-01"))
+
+#HANDLING CATEGORICAL VARIABLES
+df$GymSiteType <- relevel(as.factor(df$GymSiteType), ref = "Hybrid")
+df$GymParking  <- relevel(as.factor(df$GymParking), ref = "No Parking")
+X <- model.matrix(~ GymSiteType + GymParking, data = df)[, -1]
+df <- cbind(df, X)
+
+# Add mean pop density
+library(dplyr)
+df <- df %>%
+  mutate(
+    Dens_0_1 = rowMeans(select(., DENS_0_0.5, DENS_0.5_1), na.rm = TRUE),
+    Dens_1_4 = rowMeans(select(., DENS_1_2, DENS_2_3, DENS_3_4), na.rm = TRUE)
+  )
+
+```
+
+**EXPLORATORY DATA ANALYSIS**
+
+**TEMPORAL TRENDS**
+
+We see relatively flat membership trends, though variation across gyms is high. Promotions spike in January and September, with joining fees dropping in those months. Account payments peak in September. All these three variables show similar seasonal patterns and low between-gym variability.
+
+Two main conclusions follow:
+
+1.	We cannot conclude that membership lacks a temporal pattern without first controlling for other time-varying factors.
+
+2.	Price, promotions, and fees likely need monthly adjustments to maintain stable membership.
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+
+# Summarize data by month, calculating mean and standard deviation for selected columns
+df_summary <- df %>%
+  group_by(month_index) %>%
+  summarise(across(
+    c(Total.Members, PromoPercentage , AvgJoiningFee , AvgAccountPayment ),
+    list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))))
+
+# Add month labels for plotting
+df_summary$month_label <- factor(
+  df_summary$month_index,
+  levels = 1:12,
+  labels = month.abb)
+
+# Plot 1: Average Total Members with ribbon for standard deviation
+p1 <- ggplot(df_summary, aes(x = month_label)) +
+  geom_line(aes(y = Total.Members_mean, group = 1), color = "steelblue") +
+  geom_ribbon(aes(ymin = Total.Members_mean - Total.Members_sd,
+                  ymax = Total.Members_mean + Total.Members_sd,
+                  group = 1), alpha = 0.2) +
+  labs(title = "Average trend of Total.Members across gyms",y = "Mean ± SD",x = "Month")
+
+# Plot 2: Average Account Payment
+p2 <-ggplot(df_summary, aes(x = month_label)) +
+  geom_line(aes(y = AvgAccountPayment_mean, group = 1), color = "steelblue") +
+  geom_ribbon(aes(ymin = AvgAccountPayment_mean - AvgAccountPayment_sd, ymax = AvgAccountPayment_mean + AvgAccountPayment_sd, group = 1), alpha = 0.2) +
+  labs(title = "Average trend of AvgAccountPayment across gyms", y = "Mean ± SD", x = "Month")
+
+# Plot 3: Average Promo Percentage
+p3 <-ggplot(df_summary, aes(x = month_label)) +
+  geom_line(aes(y = PromoPercentage_mean), group = 1, color = "steelblue") +
+  geom_ribbon(aes(ymin = PromoPercentage_mean - PromoPercentage_sd, ymax = PromoPercentage_mean + PromoPercentage_sd, group = 1), alpha = 0.2) +
+  labs(title = "Average trend of PromoPercentage across gyms", y = "Mean ± SD", x = "Month")
+
+# Plot 4: Average Joining Fee
+p4 <-ggplot(df_summary, aes(x = month_label)) +
+  geom_line(aes(y = AvgJoiningFee_mean, group = 1), color = "steelblue") +
+  geom_ribbon(aes(ymin = AvgJoiningFee_mean - AvgJoiningFee_sd, ymax = AvgJoiningFee_mean + AvgJoiningFee_sd, group = 1), alpha = 0.2) +
+  labs(title = "Average trend of AvgJoiningFee across gyms", y = "Mean ± SD", x = "Month")
+
+
+# Display all plots in a 2x2 grid layout
+library(gridExtra)
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+
+
+```
+
+
+**CATEGORICAL VARIABLES**
+
+We examine two categorical variables: (1) the presence of a nearby parking lot (yes/no), and (2) the gym’s area type (residential, workforce, or hybrid) defined by the average distance between users’ homes and the gym. Figure 4 shows that gyms in workforce areas have lower average membership levels, and that there is no clear difference between gyms with and without parking; however, both patterns are unadjusted and may be influenced by other correlated factors. The actual effect of area type will be assessed more reliably during the modelling stage.
+
+```{r}
+# Calculate average number of members per gym, grouped by parking availability
+gym_avg <- df %>%
+  group_by(GymID, GymParking) %>%
+  summarise(avg_members = mean(Total.Members), .groups = "drop")
+
+# Create boxplot: average membership by parking availability
+ggplot(gym_avg, aes(x = GymParking, y = avg_members, fill = GymParking)) +
+  geom_boxplot(width = 0.6) +  # Boxplot with specified width
+  labs(
+    title = "Average Gym Membership by Parking Availability",
+    x = "",
+    y = "Average Monthly Members per Gym"
+  ) +
+  theme_minimal() +  
+  scale_y_continuous(limits = c(0, NA)) +  
+  theme(
+    legend.position = "none",  
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.text.x = element_text(size = 14)
+  )
+
+# Calculate average number of members per gym, grouped by site type
+gym_avg <- df %>%
+  group_by(GymID, GymSiteType) %>%
+  summarise(avg_members = mean(Total.Members), .groups = "drop")
+
+# Create boxplot: average membership by site type
+ggplot(gym_avg, aes(x = GymSiteType, y = avg_members, fill = GymSiteType)) +
+  geom_boxplot(width = 0.6) +
+  labs(
+    title = "Average Gym Membership by Gym Site Type",
+    x = "",
+    y = "Average Gym Membership per Gym"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.text.x = element_text(size = 14)
+  )
+
+
+```
+
+
+**CORRELATION MATRIX**
+
+Another key challenge in our dataset is the imbalance between the number of features (51) and unique gym observations (236), which risks overfitting and illustrates the curse of dimensionality. Many features are also highly correlated, both conceptually and numerically. In Bayesian models, such multicollinearity increases posterior uncertainty, making individual effect estimates less interpretable and potentially destabilizing inference (Wicker et al., 2019). 
+
+```{r}
+# Aggregate numeric columns by GymID, computing their mean
+df_between <- df %>%
+  group_by(GymID) %>%
+  summarise(across(where(is.numeric), ~ mean(., na.rm = TRUE)))
+
+# Remove columns not needed for correlation analysis
+df_between$Latitude <- NULL
+df_between$Longitude <- NULL
+df_between$month_index <- NULL
+
+# Compute correlation matrix for selected variables (first set - commented out variables excluded)
+cor_matrix <- cor(df_between[, c(
+  "Dens_0_1", "Dens_1_4",
+  "INNER_RING_SHARE", "avg_merchant_per_user", 
+  "RATIO_0_5_TO_1", "RATIO_1_TO_2", 
+  "PromoPercentage", "AvgJoiningFee", "AvgAccountPayment",
+  "distance_weighted_spend", "CompetitorIndex", 
+  "unis_within_0_0.5_mile", "unis_within_0.5_1_mile", "unis_within_1_2_mile"
+)] %>% select(where(is.numeric)))
+
+# Alternatively, another selected variable set for correlation matrix
+cor_matrix <- cor(df_between[, c(
+  "Total.Members", "GymUsableSqFt", 
+  "PromoPercentage", "AvgJoiningFee", "AvgAccountPayment", "INNER_RING_SHARE",
+  "avg_spend_per_user", "user_repeat_rate", "RATIO_0_5_TO_1", "RATIO_1_TO_2", 
+  "distance_weighted_spend", "avg_merchant_per_user", "CompetitorIndex"
+)] %>% select(where(is.numeric)))
+
+# Load corrplot for visualizing the correlation matrix
+library(corrplot)
+
+# Set plotting area
+par(mfrow = c(1,1))
+
+# Create correlation plot
+corrplot(
+  cor_matrix,
+  method = "color",         
+  type = "upper",           
+  tl.col = "black",         
+  tl.srt = 90,              
+  tl.cex = 0.7,             
+  diag = FALSE,             
+  addCoef.col = "black",    
+  number.cex = 0.55         
+)
+
+```
+***HISTOGRAMS***
+
+At the outset, it is important to highlight two key characteristics of our data. First, the response variable (total members) is a count variable, consisting of non-negative integers. Moreover, it exhibits strong overdispersion: even when considering only the yearly averages across 236 gyms (thus omitting within-gym temporal variation), the variance is 1,844,169, which is substantially greater than the sample mean of 5,049.5. 
+
+Second, when examining a non-exhaustive selection of key variables from our dataset, we observe clear signs of non-normality in their distributions characterized by heavy tails, skewness, and sometimes lack of unimodality.
+
+Together, these two observations lead us to conclude that we should first scale and normalize the explanatory variables. For modelling the response, a negative binomial distribution is more appropriate, as standard Poisson or Gaussian assumptions are unlikely to perform well.
+
+
+```{r}
+# EDA BOXPLOTS 
+library(dplyr)
+
+# Aggregate gym-level average values from df
+gym_avg <- df %>%
+  group_by(GymID) %>%
+  summarise(
+    Total.Members = mean(Total.Members, na.rm = TRUE),
+    GymMaxOccupancy = first(GymMaxOccupancy),  
+    unis_within_0_0.5_mile = first(unis_within_0_0.5_mile),
+    
+    # Means for continuous features
+    PromoPercentage = mean(PromoPercentage, na.rm = TRUE),
+    AvgJoiningFee = mean(AvgJoiningFee, na.rm = TRUE),
+    AvgAccountPayment = mean(AvgAccountPayment, na.rm = TRUE),
+    UMAP2D_1 = mean(UMAP2D_1, na.rm = TRUE),
+    UMAP2D_2 = mean(UMAP2D_2, na.rm = TRUE),
+    BASEADL_0.5 = mean(BASEADL_0.5, na.rm = TRUE),
+    POP_0.5_1 = mean(POP_0.5_1, na.rm = TRUE),
+    GymUsableSqFt = mean(GymUsableSqFt, na.rm = TRUE),
+    CompetitorIndex = mean(CompetitorIndex, na.rm = TRUE),
+    POP_1_2 = mean(POP_1_2, na.rm = TRUE),
+    distance_weighted_spend = mean(distance_weighted_spend),
+    
+    # Population densities by distance bands
+    DENS_0_0.5 = mean(DENS_0_0.5),
+    DENS_0.5_1 = mean(DENS_0.5_1),
+    DENS_1_2 = mean(DENS_1_2),
+    DENS_2_3 = mean(DENS_2_3),
+    DENS_3_4 = mean(DENS_3_4),
+    
+    # Engagement/spend/user behavior metrics
+    avg_merchant_per_user = mean(avg_merchant_per_user),
+    user_repeat_rate = mean(user_repeat_rate),
+    avg_spend_per_user = mean(avg_spend_per_user),
+    user_density = mean(user_density),
+    
+    # University proximity
+    unis_within_0_0.5_mile = mean(unis_within_0_0.5_mile),
+    unis_within_0.5_1_mile = mean(unis_within_0.5_1_mile),
+    unis_within_1_2_mile = mean(unis_within_1_2_mile),
+    
+    # Drop-off metrics and ring shares
+    DENSITY_DROP_2 = mean(DENSITY_DROP_2),
+    DENSITY_DROP_3 = mean(DENSITY_DROP_3),
+    DENSITY_DROP_4 = mean(DENSITY_DROP_4),
+    INNER_RING_SHARE = mean(INNER_RING_SHARE),
+    
+    # Population ratio bands
+    RATIO_0_5_TO_1 = mean(RATIO_0_5_TO_1),
+    RATIO_1_TO_2 = mean(RATIO_1_TO_2),
+    
+    # Overall population densities
+    Dens_0_1 = mean(Dens_0_1),
+    Dens_1_4 = mean(Dens_1_4)
+  )
+
+# Select variables of interest to visualize
+vars_to_plot <- c(
+  "Total.Members",
+  "user_density", "Dens_0_1", "Dens_1_4",
+  "user_repeat_rate",
+  "RATIO_0_5_TO_1", "RATIO_1_TO_2", "avg_merchant_per_user",
+  "PromoPercentage", "AvgJoiningFee", "AvgAccountPayment",
+  "distance_weighted_spend", "CompetitorIndex",
+  "unis_within_0_0.5_mile", "unis_within_0.5_1_mile", "unis_within_1_2_mile"
+)
+
+# Subset data for those selected variables
+data_for_plot <- gym_avg[, vars_to_plot]
+
+# Set plotting layout: 4 rows, 4 columns
+par(mfrow = c(3, 3))
+
+# Create histograms for each selected variable
+for (var in names(data_for_plot)) {
+  hist(data_for_plot[[var]],
+       main = var,              
+       col = "lightblue",       
+       breaks = 20,            
+       xlab = "")          
+}
+
+```
+
+
+**REGIONAL ANALYSIS**
+
+One way to explore the spatial distribution of the data is by identifying the administrative region each gym belongs to. 
+
+A key observation is that London is heavily overrepresented, with 70 out of 236 gyms located there. To account for this imbalance, separating London into five distinct districts is a reasonable approach. Additionally, we observe substantial variation in average revenue and price across regions. London gyms tend to attract the highest number of members and charge higher prices, resulting in top-performing revenue figures. In fact, all 5 London districts are in top 5 regions in terms of revenue. This likely explains why the company is focusing so heavily on the London market.
+
+
+
+```{r}
+library(MASS)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# Add UK regions column to df
+uk_regions <- ne_states(country = "United Kingdom", returnclass = "sf")
+df_sf <- st_as_sf(df, coords = c("Longitude", "Latitude"), crs = 4326)
+df_with_region <- st_join(df_sf, uk_regions["name"])
+df_with_region <- st_join(df_with_region, uk_regions["region"])
+df_with_region$Longitude <- st_coordinates(df_with_region)[, 1]
+df_with_region$Latitude <- st_coordinates(df_with_region)[, 2]
+df <- as.data.frame(df_with_region)
+
+library(dplyr)
+df %>%
+  filter(is.na(name)) %>%
+  distinct(GymID, .keep_all = TRUE)
+
+df[df$GymID == "Gym23", ]$name <- "Lancashire"
+df[df$GymID == "Gym23", ]$region <- "North West"
+
+df[df$GymID == "Gym25", ]$name <- "Dorset"
+df[df$GymID == "Gym25", ]$region <- "South West"
+
+df[df$GymID == "Gym199", ]$name <- "Devon"
+df[df$GymID == "Gym199", ]$region <- "South West"
+
+df[df$GymID == "Gym200", ]$name <- "Devon"
+df[df$GymID == "Gym200", ]$region <- "South West"
+
+# Define London boroughs by 5 subregions
+london_subregions <- data.frame(
+  name = c(
+    # Central London (6 boroughs)
+    "Camden", "Islington", "Westminster", "Kensington and Chelsea", 
+    "Lambeth", "Southwark",
+    
+    # North London (3)
+    "Barnet", "Enfield", "Haringey",
+    
+    # South London (10)
+    "Bromley", "Croydon", "Greenwich", "Kingston upon Thames", 
+    "Lewisham", "Merton", "Richmond upon Thames", "Sutton", "Wandsworth", "Bexley",
+    
+    # East London (7)
+    "Barking and Dagenham", "Hackney", "Havering", "Newham", 
+    "Redbridge", "Tower Hamlets", "Waltham Forest",
+    
+    # West London (6)
+    "Brent", "Ealing", "Hammersmith and Fulham", "Harrow", 
+    "Hillingdon", "Hounslow"
+  ),
+  FinalRegion = c(
+    rep("Central London", 6),
+    rep("North London", 3),
+    rep("South London", 10),
+    rep("East London", 7),
+    rep("West London", 6)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Merge into df
+df <- df %>%
+  left_join(london_subregions, by = "name")
+
+df$FinalRegion[is.na(df$FinalRegion)] <- df$region[is.na(df$FinalRegion)]
+
+df[df$FinalRegion == "South East", ]$FinalRegion <- "South East England"
+df[df$FinalRegion == "East", ]$FinalRegion <- "East England"
+df[df$FinalRegion == "South Western", ]$FinalRegion <- "South Western Scotland"
+df[df$FinalRegion == "Eastern", ]$FinalRegion <- "Eastern Scotland"
+df[df$FinalRegion == "North West", ]$FinalRegion <- "North West England"
+df[df$FinalRegion == "South West", ]$FinalRegion <- "South West England"
+df[df$FinalRegion == "North East", ]$FinalRegion <- "North East England"
+
+# Count unique GymIDs by region
+region_gym_counts <- df %>%
+  group_by(FinalRegion) %>%
+  summarise(UniqueGyms = n_distinct(GymID)) %>%
+  arrange(desc(UniqueGyms))
+
+print(region_gym_counts, n = 120)
+
+# Summarise metrics by region
+region_gym_stats <- df %>%
+  group_by(FinalRegion) %>%
+  summarise(
+    UniqueGyms = n_distinct(GymID),
+    AvgMembers = mean(Total.Members, na.rm = TRUE),
+    AvgAccountPayment = mean(AvgAccountPayment, na.rm = TRUE),
+    AvgRevenue = mean(Total.Members * AvgAccountPayment, na.rm = TRUE)
+  ) %>%
+  arrange(desc(AvgRevenue))
+
+print(region_gym_stats)
+
+library(knitr)
+kable(region_gym_stats, digits = 1, format = "simple")
+
+# Order regions by median Total.Members for plotting
+df$FinalRegion <- reorder(df$FinalRegion, df$Total.Members, FUN = median)
+
+# Plot Total.Members by region
+ggplot(df, aes(x = FinalRegion, y = Total.Members)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Total.Members by UK Region",
+       x = "Region",
+       y = "Total Members") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+#Plot all administrative borders used and all gyms from the dataset
+library(ggplot2)
+library(sf)
+uk_regions <- ne_states(country = "United Kingdom", returnclass = "sf")
+df_sf <- st_as_sf(df, coords = c("Longitude", "Latitude"), crs = 4326)
+library(dplyr)
+
+uk_regions <- uk_regions %>%
+  mutate(region = case_when(
+    region == "South East" ~ "South East England",
+    region == "East" ~ "East England",
+    region == "South Western" ~ "South Western Scotland",
+    region == "Eastern" ~ "Eastern Scotland",
+    region == "North West" ~ "North West England",
+    region == "South West" ~ "South West England",
+    region == "North East" ~ "North East England",
+    TRUE ~ region  
+  ))
+
+my_colors <- c(
+  "cyan", "blue", "green", "orange", "purple", "red", "pink", "brown",
+  "yellow", "darkgreen", "darkblue", "gold", "magenta", "turquoise", "grey40", "coral"
+)
+
+# Base map: UK regions as polygons
+ggplot() +
+  geom_sf(data = uk_regions, aes(fill = region), color = "white", alpha = 0.5) +  # regions
+  geom_sf(data = df_sf, color = "red", size = 1) +  # gyms as points
+  theme_minimal() +
+  labs(title = "Gyms Across UK Regions",
+       fill = "Region") +
+  scale_fill_manual(values = my_colors) +
+  theme(legend.position = "bottom")
+
+
+```
+
+
+
+***LONDON CASE STUDY WITH UNDERPERFORMING GYMS***
+
+We begin our project by illustrating the core problem through a closer look at gyms in the Greater London area, with a particular focus on central London. Among these, we identify three gyms (125, 111, and 134) as clear underperformers in terms of both total members and revenue.
+
+One possible explanation is that these gyms are simply smaller in size, leading to lower membership. To explore this, we plot members vs. size for all Greater London gyms, revealing a positive, likely quadratic, relationship. This explains Gym125’s low count—it’s the smallest in London. However, Gyms 134 and 111 are average in size but still underperform, so size alone doesn’t explain their low membership.
+
+Another speculative explanation is that these gyms were low-cost investments, yielding revenue typical of less competitive regions (e.g., Northeast England or Scotland). However, all three gyms are in highly central London, likely among the most expensive UK areas. If we speculatively assume that square footage costs are relatively uniform across central London, then Gyms 111 and 134 stand out as particularly poor investments. 
+
+This example highlights the importance of carefully selecting gym locations and underscores the need for a data-driven statistical approach to support investment decisions and avoid costly misallocations.
+
+
+```{r}
+library(dplyr)
+
+# Aggregate data per GymID for plotting
+aggregated_data <- df %>%
+  group_by(GymID) %>%
+  summarise(
+    GymUsableSqFt = mean(GymUsableSqFt, na.rm = TRUE),
+    FinalRegion = first(FinalRegion),
+    region = first(region),
+    AvgAccountPayment = mean(AvgAccountPayment),
+    Total.Members = mean(Total.Members)
+  )
+
+# Filter for gyms in the Greater London region
+london_data <- aggregated_data %>%
+  filter(region == "Greater London")
+
+# Identify specific gyms to highlight
+highlighted_gyms <- london_data[london_data$GymID %in% c("Gym134", "Gym111", "Gym125"), ]
+
+# Scatter plot: Revenue vs Total Members with highlighted gyms and quadratic trend
+ggplot(london_data, aes(x = GymUsableSqFt, y = Total.Members)) +
+  geom_point(size = 3) +
+  geom_point(  # Highlight specific gyms in red
+    data = highlighted_gyms,
+    aes(x = GymUsableSqFt, y = Total.Members),
+    color = "red",
+    size = 3
+  ) +
+  geom_text(  # Label highlighted gyms
+    data = highlighted_gyms,
+    aes(label = GymID),
+    color = "red",
+    size = 3.5,
+    vjust = -0.7
+  ) +
+  geom_smooth(  
+    method = "lm",
+    formula = y ~ poly(x, 2),    # Add quadratic trend line
+    color = "blue",
+    se = FALSE
+  ) +
+  scale_x_continuous(breaks = seq(0, 6000000, by = 500000)) +
+  scale_y_continuous(breaks = seq(0, max(london_data$Total.Members, na.rm = TRUE), by = 1000)) +
+  labs(
+    x = "Annual revenue",
+    y = "Total Members",
+    title = "Greater London Gyms: Annual revenue vs Total Members"
+  ) +
+  theme_minimal()
+
+# Load mapping and geocoding libraries
+library(ggmap)
+library(ggplot2)
+library(ggrepel)
+
+# Register Google API key
+register_google(key = "AIzaSyBu-nst4qjIgZ18nov4pb_j8Py8jGJ9Bto")
+
+# Filter for Central London gyms and convert GymID to character for labeling
+central_london_gyms <- df %>%
+  filter(FinalRegion == "Central London") %>%
+  mutate(GymID = as.character(GymID))
+
+# Highlight specific gyms in Central London
+highlighted_gyms <- central_london_gyms[central_london_gyms$GymID %in% c("Gym134", "Gym111", "Gym125"), ]
+
+# Get a styled Google Map of Central London
+map <- get_googlemap(
+  center = c(lon = -0.1, lat = 51.51),
+  zoom = 13,
+  maptype = "roadmap",
+  style = c(
+    "feature:poi|visibility:off",
+    "feature:administrative|visibility:off",
+    "feature:road.local|element:labels|visibility:off",
+    "feature:transit|visibility:off",
+    "feature:landscape.natural|visibility:off"
+  )
+)
+
+# Plot gym locations on the map
+ggmap(map) +
+  geom_point(
+    data = central_london_gyms,
+    aes(x = Longitude, y = Latitude, size = Total.Members),
+    color = "blue", alpha = 1
+  ) +
+  
+  geom_text(  # Label all Central London gyms in blue
+    data = central_london_gyms,
+    aes(x = Longitude, y = Latitude, label = GymID),
+    color = "blue",
+    size = 4,
+    vjust = -0.75
+  ) +
+  
+  geom_text(  # Label highlighted gyms in red
+    data = highlighted_gyms,
+    aes(x = Longitude, y = Latitude, label = GymID),
+    color = "red",
+    size = 4,
+    vjust = -0.75
+  ) +
+  
+  geom_point(  # Highlight gyms in red
+    data = highlighted_gyms,
+    aes(x = Longitude, y = Latitude, size = Total.Members),
+    color = "red", alpha = 1
+  ) +
+  
+  scale_size_continuous(  # Adjust point sizes and size legend
+    range = c(0.5, 6),
+    name = "Gym Sq Ft",
+    breaks = c(1000, 2000, 3000, 4000, 5000, 6000)
+  ) +
+  
+  labs(
+    title = "Central London Gyms: Total Members & Location",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+***PREPARING DATA FOR INLA***
+
+```{r}
+library(INLA)
+library(inlabru)
+
+# Create coordinate data frame from df
+Locations = data.frame(lon = df$Longitude, lat = df$Latitude)
+
+# Create spatial mesh
+mesh_space <- inla.mesh.2d(loc = Locations, max.edge = c(1, 2))
+
+# Define spatial SPDE model using penalized complexity priors
+spde_space <- inla.spde2.pcmatern(
+  mesh = mesh_space,
+  prior.range = c(1, 0.05),
+  prior.sigma = c(1, 0.05)
+)
+
+# Add geometry column to df
+library(sf)
+geometry_sf <- st_as_sf(Locations, coords = c("lon", "lat"), crs = 4326)
+df$geometry <- geometry_sf$geometry
+
+# Create temporal mesh and SPDE model
+time_seq <- seq(min(df$month_index), max(df$month_index), length.out = 100)
+mesh_time <- inla.mesh.1d(time_seq)
+spde_time <- inla.spde2.pcmatern(
+  mesh = mesh_time,
+  prior.range = c(1, 0.5),
+  prior.sigma = c(1, 0.5)
+)
+
+# SCALE NUMERIC FEATURES -------------------------------------------------------------
+library(dplyr)
+
+# Define excluded columns (non-numeric)
+exclude_cols <- c("GymSiteType", "GymParking")
+
+# Define numeric columns to scale
+scale_cols <- c(
+  "GymUsableSqFt", "GymMaxOccupancy", "unis_within_0_0.5_mile",
+  "unis_within_0.5_1_mile", "unis_within_1_2_mile", "PromoPercentage",
+  "AvgJoiningFee", "AvgAccountPayment", "UMAP2D_1", "UMAP2D_2",
+  "BASEADL_0.5", "POP_0.5_1", "POP_1_2", "POP_2_3", "POP_3_4",
+  "DENS_0_0.5", "DENS_0.5_1", "DENS_1_2", "DENS_2_3", "DENS_3_4",
+  "DENSITY_DROP_2", "DENSITY_DROP_3", "DENSITY_DROP_4", "NEAR_POP_SHARE",
+  "INNER_RING_SHARE", "RATIO_0_5_TO_1", "RATIO_1_TO_2", "X0.0.5_mile_comp",
+  "X0.5.1_mile_comp", "X1.2_mile_comp", "CompetitorIndex",
+  "transaction_density_4", "user_density", "avg_spend_per_user",
+  "user_repeat_rate", "distance_weighted_spend", "avg_merchant_per_user",
+  "txn_count_0_1_mi", "txn_density_0_1_mi", "txn_count_1_2_mi",
+  "txn_density_1_2_mi", "txn_count_2_3_mi", "txn_density_2_3_mi",
+  "txn_count_3_4_mi", "txn_density_3_4_mi", "Dens_0_1", "Dens_1_4"
+)
+
+# Scale selected columns and add "_s" suffix
+df_scaled <- df %>%
+  mutate(across(
+    .cols = all_of(scale_cols),
+    .fns = ~ as.numeric(scale(.)),
+    .names = "{.col}_s"
+  ))
+
+# Create squared terms for selected scaled features
+df_scaled$AvgAccountPayment_s2 <- df_scaled$AvgAccountPayment_s^2
+df_scaled$AvgJoiningFee_s2 <- df_scaled$AvgJoiningFee_s^2
+
+
+```
+
+***BASELINE MODEL: ONLY FIXED EFFECTS***
+
+We began our modeling with a fixed-effects-only specification as a simple baseline, fully aware that it is not well suited to our panel structure. In particular, many predictors are time-invariant across months, and the model lacks the flexibility to capture gym-specific or spatial variation — limiting both its explanatory and predictive power. Nonetheless, it served as a useful reference point for more sophisticated structures.
+
+```{r}
+components1 <-  ~ Intercept(main = 1) + 
+  GymSiteTypeResidential + GymSiteTypeWorkforce +
+  GymParkingParking +
+  unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s + unis_within_1_2_mile_s +
+  PromoPercentage_s  +  AvgJoiningFee_s + AvgAccountPayment_s + AvgAccountPayment_s2+
+  Dens_0_1_s + Dens_1_4_s + 
+  INNER_RING_SHARE_s +             
+  CompetitorIndex_s + distance_weighted_spend_s +
+  user_repeat_rate_s   +
+  RATIO_1_TO_2_s + RATIO_0_5_TO_1_s +avg_merchant_per_user_s 
+
+bru_fit1 <- bru(
+  components = components1,
+  formula = Total.Members ~ .,
+  family = "nbinomial",
+  data = df_scaled,
+  options = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+)
+
+# View summary
+summary(bru_fit1)
+
+# Extract the CPO vector for all observations
+cpo_values <- bru_fit1$cpo$cpo
+# Compute the LCPO 
+lcpo <- sum(log(cpo_values), na.rm = TRUE)
+lcpo
+
+par(mfrow = c(3, 3))  
+
+for (name in names(bru_fit1$marginals.fixed)) {
+  marginal <- INLA::inla.smarginal(bru_fit1$marginals.fixed[[name]])  
+  plot(marginal, type = "l", main = name, xlab = "Value", ylab = "Density")
+  abline(v=0)
+}
+```
+
+***REGIONAL RANDOM EFFECTS MODEL***
+
+To introduce a spatial signal that generalizes across locations, we next fit a model with region as a random effect. This only marginally improved WAIC and LCPO relative to baseline and only roughly allowed us to detect broad geographic patterns — most regional effects were statistically insignificant. 
+
+A peculiar feature of the regional random effects model was that the credible intervals for many covariates remained notably narrower than those observed in the GymID random effects and SPDE models (see, Figure 8). This pattern was also present in the fixed-effects baseline. We may conclude that, for some reason, models that do not properly account for the panel structure of the data tend to deliver overconfident parameter estimates, likely underestimating true uncertainty. This observation further motivated the move to more flexible specifications like the SPDE model, which better accommodate the data’s hierarchical and spatial complexity. 
+
+
+```{r}
+components2 <-  ~ Intercept(main = 1) + 
+  GymSiteTypeResidential + GymSiteTypeWorkforce +
+  GymParkingParking +
+  unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s + unis_within_1_2_mile_s +
+  PromoPercentage_s  +  AvgJoiningFee_s + AvgAccountPayment_s + AvgAccountPayment_s2+
+  Dens_0_1_s + Dens_1_4_s + 
+  INNER_RING_SHARE_s +             
+  CompetitorIndex_s + distance_weighted_spend_s +
+  user_repeat_rate_s   +
+  RATIO_1_TO_2_s + RATIO_0_5_TO_1_s +avg_merchant_per_user_s +
+  f(FinalRegion, model = "iid")  
+
+
+bru_fit2 <- bru(
+  components = components2,
+  formula = Total.Members ~ .
+  ,
+  family = "nbinomial",
+  data = df_scaled,
+  options = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+)
+
+# View summary
+summary(bru_fit2)
+
+# Extract the CPO vector for all observations
+cpo_values <- bru_fit2$cpo$cpo
+# Compute the LCPO 
+lcpo <- sum(log(cpo_values), na.rm = TRUE)
+lcpo
+
+par(mfrow = c(3,3))  
+
+for (name in names(bru_fit2$marginals.fixed)) {
+  marginal <- INLA::inla.smarginal(bru_fit2$marginals.fixed[[name]])  
+  plot(marginal, type = "l", main = name, xlab = "Value", ylab = "Density")
+  abline(v=0)
+}
+
+region_effects <- bru_fit2$summary.random$f
+
+library(ggplot2)
+ggplot(region_effects, aes(x = reorder(ID, mean), y = mean)) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), width = 0.3) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +  
+  labs(
+    title = "Random Effects by Region",
+    x = "Region",
+    y = "Effect (log-scale adjustment)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.text.x = element_text(size = 14)
+  )
+```
+
+***GYM ID RANDOM EFFECTS MODEL***
+
+To better capture unobserved heterogeneity across locations, we introduced hierarchical models starting with Gym ID as a random effect. This substantially improved model fit according to LCPO and WAIC. The estimated gym-level effects revealed consistent over- and underperformance among specific gyms, indicating meaningful variation unexplained by fixed covariates (see, figure 9). This structure is particularly useful for forecasting future performance at existing gyms, where past observations inform gym-specific adjustments.
+
+However, this approach does not aid in predicting demand for new locations. When performing 10-fold cross-validation by holding out entire gyms, the model's performance reverted to that of the fixed-effects baseline. This is expected: for unseen gyms, the random effect is set to zero, and predictions rely entirely on fixed effects. Notably, this limitation is not captured by LCPO or WAIC, as both metrics leave out only a single monthly observation while retaining the gym's random effect—resulting in information leakage and overly optimistic evaluation for models intended to generalize to new gyms.
+
+
+```{r}
+components2 <-  ~ Intercept(main = 1) + 
+  GymSiteTypeResidential + GymSiteTypeWorkforce +
+  GymParkingParking +
+  unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s + unis_within_1_2_mile_s +
+  PromoPercentage_s  +  AvgJoiningFee_s + AvgAccountPayment_s + AvgAccountPayment_s2+
+  Dens_0_1_s + Dens_1_4_s + 
+  INNER_RING_SHARE_s +             
+  CompetitorIndex_s + distance_weighted_spend_s +
+  user_repeat_rate_s   +
+  RATIO_1_TO_2_s + RATIO_0_5_TO_1_s +avg_merchant_per_user_s +
+  f(GymID, model = "iid")  
+
+
+bru_fit2 <- bru(
+  components = components2,
+  formula = Total.Members ~ .
+  ,
+  family = "nbinomial",
+  data = df_scaled,
+  options = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+)
+
+# View summary
+summary(bru_fit2)
+
+# Extract the CPO vector for all observations
+cpo_values <- bru_fit2$cpo$cpo
+# Compute the LCPO (log pseudo marginal likelihood)
+lcpo <- sum(log(cpo_values), na.rm = TRUE)
+lcpo
+
+par(mfrow = c(3,3))  
+
+for (name in names(bru_fit2$marginals.fixed)) {
+  marginal <- INLA::inla.smarginal(bru_fit2$marginals.fixed[[name]])  # smooth marginal
+  plot(marginal, type = "l", main = name, xlab = "Value", ylab = "Density")
+  abline(v=0)
+}
+
+region_effects <- bru_fit2$summary.random$f
+
+library(ggplot2)
+ggplot(region_effects, aes(x = reorder(ID, mean), y = mean)) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), width = 0.3) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +  
+  labs(
+    title = "Random Effects by Gym ID",
+    x = "Gym",
+    y = "Effect (log-scale adjustment)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.text.x = element_text(size = 14)
+  )
+```
+
+
+
+***SPDE FINAL MODEL***
+
+Finally, we move on to our most sophisticated model, which incorporates a spatial effect using the SPDE (Stochastic Partial Differential Equation) approach. SPDE allows us to model spatially structured random effects continuously over geographic space, capturing smooth spatial correlations between gym locations. It does this by projecting the spatial process onto a mesh, efficiently approximating a Gaussian field.
+
+The model fits well and shows a clear improvement over the fixed-effects and regional random-effects models, as reflected by better LCPO and WAIC scores (see, Table 2 & Figure 11). While its predictive performance is like the Gym ID random-effects model, the SPDE model takes a conceptually more appropriate approach to generalization: it learns spatial correlations from the data and leverages them to make informed predictions for new, unseen locations. Additionally, the issue with appropriately addressing panel data is mitigated, and credible intervals are well-calibrated and comparable to those in the GymID RE model.
+
+Credible intervals being narrower enables a more reliable second-stage feature evaluation. Variables such as gym classification (workforce, residential, or hybrid) show little effect, with wide intervals centered around zero. Likewise, the average number of gyms used per user and the count of nearby universities (1–2-mile range) appear insignificant. Population ratio variables also lack predictive power once aggregated population density variables are included. Thus, we drop these variables which marginally increases WAIC and LCPO scores.
+
+
+```{r}
+components3 <-  ~ Intercept(main = 1) + 
+  GymSiteTypeResidential + GymSiteTypeWorkforce +
+  GymParkingParking +
+  unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s +# unis_within_1_2_mile_s +
+  PromoPercentage_s  + AvgAccountPayment_s + AvgJoiningFee_s + AvgAccountPayment_s2+
+  Dens_0_1_s + Dens_1_4_s + 
+  #INNER_RING_SHARE_s +             
+  CompetitorIndex_s + distance_weighted_spend_s +
+  user_repeat_rate_s   +
+  #RATIO_1_TO_2_s + RATIO_0_5_TO_1_s +avg_merchant_per_user_s +
+  spde_space(geometry, model = spde_space) +  
+  spde_time(month_index, model=spde_time)
+
+
+bru_fit3 <- bru(
+  components = components3,
+  formula = Total.Members ~ .
+  ,
+  family = "nbinomial",
+  data = df_scaled,
+  options = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+)
+
+# View summary
+summary(bru_fit3)
+
+# Extract the CPO vector for all observations
+cpo_values <- bru_fit3$cpo$cpo
+# Compute the LCPO (log pseudo marginal likelihood)
+lcpo <- sum(log(cpo_values), na.rm = TRUE)
+lcpo
+
+par(mfrow = c(3, 3))  
+
+for (name in names(bru_fit3$marginals.fixed)) {
+  marginal <- INLA::inla.smarginal(bru_fit3$marginals.fixed[[name]])  # smooth marginal
+  plot(marginal, type = "l", main = name, xlab = "Value", ylab = "Density")
+  abline(v=0)
+}
+
+
+
+
+# Create a grid over the spatial mesh for prediction
+grid_surface <- fm_pixels(mesh_space, dims = c(200, 200), format = "sf")
+grid_surface$geo_point <- st_geometry(grid_surface)  # Extract geometry column for plotting
+
+# Predict latent spatial field on the grid
+field_prediction <- predict(bru_fit3, newdata = grid_surface, formula = ~ spde_space)
+
+# Convert UK regions object to data frame for manipulation
+uk_regions <- as.data.frame(uk_regions)
+
+library(dplyr)
+library(sf)
+
+# Group and dissolve subregions into larger UK regions (e.g., North West, East Midlands, etc.)
+uk_regions_region_level <- as.data.frame(uk_regions %>%
+  group_by(region) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  st_as_sf())
+
+# Merge all regions into a single geometry (UK land mass)
+uk_land <- uk_regions_region_level %>%
+  summarise(geometry = st_union(geometry)) %>%
+  st_as_sf()
+
+# Define bounding box and calculate surrounding sea area (difference between bbox and land)
+bbox <- st_as_sfc(st_bbox(uk_land))
+sea_area <- st_difference(bbox, st_union(uk_land))
+
+# View the coordinate reference system of the predicted field
+st_crs(field_prediction)
+
+library(ggplot2)
+
+# Create the map
+ggplot() +
+  gg(mesh_space) +  # Add mesh structure (triangulated spatial domain)
+  gg(field_prediction, aes(color = mean)) +  # Plot predicted field mean values over the grid
+  geom_sf(data = uk_regions_region_level, aes(geometry = geometry), fill = NA, color = "blue", linewidth = 0.1) +  
+  
+  # Custom color scale for mean field values (red to white to green)
+  scale_color_gradientn(
+    colors = c("red3",  "white", "green3"),
+    values = scales::rescale(c(min(field_prediction$mean, na.rm = TRUE), 
+                               0, 
+                               max(field_prediction$mean, na.rm = TRUE))),
+    limits = range(field_prediction$mean, na.rm = TRUE),
+    name = "Mean"
+  ) +
+
+  coord_sf() +  
+  theme_minimal() +
+
+  # Plot title and axis labels
+  labs(
+    title = "Posterior distribution of the latent spatial field",
+    x = "Longitude",
+    y = "Latitude"
+  )  +
+
+  # Theme adjustments for better readability
+  theme(
+    plot.title = element_text(size = 22, face = "bold"),
+    axis.title.y = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.text = element_text(size = 18),
+    axis.text.x = element_text(size = 18),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18)
+  )
+
+
+```
+
+***10-FOLD CROSS VALIDATION EXAMPLE***
+
+```{r}
+# Load necessary libraries
+library(INLA)
+library(inlabru)
+library(dplyr)
+library(Metrics)
+
+# Set seed and assign 10 folds by GymID
+set.seed(34)
+all_gyms <- unique(df_scaled$GymID)
+folds <- sample(rep(1:10, length.out = length(all_gyms)))
+gym_folds <- data.frame(GymID = all_gyms, fold = folds)
+
+# Merge fold assignments
+df_scaled <- df_scaled %>%
+  left_join(gym_folds, by = "GymID")
+
+components3 <-  ~ Intercept(main = 1) + 
+  GymSiteTypeResidential + GymSiteTypeWorkforce +
+  GymParkingParking +
+  unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s +#unis_within_1_2_mile_s +
+  PromoPercentage_s +  AvgJoiningFee_s + AvgAccountPayment_s + AvgAccountPayment_s2+
+  Dens_0_1_s + Dens_1_4_s + 
+  #INNER_RING_SHARE_s +             
+  CompetitorIndex_s + distance_weighted_spend_s +
+  user_repeat_rate_s   +
+  #RATIO_1_TO_2_s + RATIO_0_5_TO_1_s + #avg_merchant_per_user_s +
+  #f(FinalRegion, model="iid") 
+  spde_space(geometry, model = spde_space) +
+  spde_time(month_index, model=spde_time)
+
+# Define function to run bru for each fold
+run_bru_fold <- function(train_data, test_data, fold_num) {
+  fit <- bru(
+    components = components3,
+    formula = Total.Members ~ .,
+    family = "nbinomial",
+    data = train_data,
+    options = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+  )
+  
+  pred <- predict(fit, newdata = test_data, formula = ~ Intercept + 
+                    GymSiteTypeResidential + GymSiteTypeWorkforce +
+                    GymParkingParking +
+                    unis_within_0_0.5_mile_s + unis_within_0.5_1_mile_s +#unis_within_1_2_mile_s +
+                    PromoPercentage_s +  AvgJoiningFee_s + AvgAccountPayment_s + AvgAccountPayment_s2+
+                    Dens_0_1_s + Dens_1_4_s + 
+                    #INNER_RING_SHARE_s +             
+                    CompetitorIndex_s + distance_weighted_spend_s +
+                    user_repeat_rate_s   +
+                    #RATIO_1_TO_2_s + RATIO_0_5_TO_1_s + #avg_merchant_per_user_s +
+                    spde_space +
+                    spde_time
+                  )
+  
+  predictions <- data.frame(
+    fold = fold_num,
+    actual = test_data$Total.Members,
+    predicted = exp(pred$mean)
+  )
+  
+  rmse_val <- rmse(predictions$actual, predictions$predicted)
+  
+  list(
+    predictions = predictions,
+    rmse = data.frame(fold = fold_num, rmse = rmse_val)
+  )
+}
+
+
+cv_results <- list()
+for (k in 1:10) {
+  cat("Running fold", k, "\n")
+  
+  train_data <- df_scaled %>% filter(fold != k)
+  test_data  <- df_scaled %>% filter(fold == k)
+  
+  cv_results[[k]] <- run_bru_fold(train_data, test_data, fold_num = k)
+}
+
+cv_combined <- bind_rows(cv_results)
+
+mean_rmse <- mean(cv_combined$rmse$rmse)
+
+cat("10-fold CV RMSE per fold:\n")
+print(cv_combined)
+cat("\nAverage RMSE across folds:", mean_rmse, "\n")
+
+
+library(ggplot2)
+ggplot(cv_combined$predictions, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Predicted vs Actual Gym Membership (10-fold CV) - SPDE model",
+    x = "Actual Total Members",
+    y = "Predicted Total Members"
+  ) +
+  xlim(0, 10000) +
+  ylim(0, 10000) +
+  theme_minimal() + 
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 16),
+    axis.title.x = element_text(size = 16),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(size = 14)
+  )
+
+```
+
+
+***PRICE OPTIMIZATION MODEL***
+
+Our final SPDE model appears to be optimal for explaining variations in demand; however, it performs poorly when used to identify an optimal price point. We quickly notice that the model’s initial coefficients for the linear and quadratic price terms (0.017 and -0.002, respectively) suggest a highly inelastic demand, with the predicted revenue-maximizing price exceeding £500 which is highly unrealistic.
+
+This initial model also fails to account for potential price interactions. We explored several alternative models using different combinations of variables, but most yielded similarly unrealistic results. Frequently, the coefficient for the squared price term approached zero or even became positive.
+
+The model below was fitted with GLM with negative binomial family and was the one returning the most reasonable results, though even this model’s optimal price prediction remained significantly higher than the observed average price of £38.6 
+
+```{r}
+# Add relevant interaction terms
+df_scaled$GymParkingNoParking <- 1- df_scaled$GymParkingParking 
+df_scaled$GymSiteTypeHybrid <- as.numeric((df_scaled$GymSiteTypeResidential == 0 & df_scaled$GymSiteTypeWorkforce == 0))
+
+df_scaled <- df_scaled %>%
+  mutate(
+    interaction_workforce = AvgAccountPayment_s * GymSiteTypeWorkforce,
+    interaction_hybrid    = AvgAccountPayment_s * GymSiteTypeHybrid,
+    interaction_parking   = AvgAccountPayment_s * GymParkingParking,
+    interaction_noparking   = AvgAccountPayment_s * GymParkingNoParking,
+    interaction_residential    = AvgAccountPayment_s * GymSiteTypeResidential,
+    interaction_competition = AvgAccountPayment_s * CompetitorIndex_s
+  )
+
+
+library(fastDummies)
+df_scaled <- fastDummies::dummy_cols(df_scaled, select_columns = "region", remove_first_dummy = FALSE)
+df_scaled <- fastDummies::dummy_cols(df_scaled, select_columns = "month_index", remove_first_dummy = FALSE)
+
+
+
+price_grid <- seq(10, 150, by = 1)
+price_mean <- mean(df$AvgAccountPayment, na.rm = TRUE)
+price_sd <- sd(df$AvgAccountPayment, na.rm = TRUE)
+price_scaled <- (price_grid - price_mean) / price_sd
+
+# Fit a negative binomial GLM
+lm_model <- glm.nb(
+  Total.Members ~ AvgAccountPayment_s + I(AvgAccountPayment_s^2) +
+    AvgAccountPayment_s:as.factor(month_index) +
+    user_repeat_rate_s +
+    AvgAccountPayment_s:GymSiteTypeWorkforce +
+    AvgAccountPayment_s:GymSiteTypeResidential +
+    AvgAccountPayment_s:GymParkingParking,
+  data = df_scaled
+)
+
+# View model summary
+summary(lm_model)
+
+# Extract coefficient estimates and standard errors
+lm_coef <- coef(summary(lm_model))
+coef_means <- lm_coef[, "Estimate"]
+coef_sds <- lm_coef[, "Std. Error"]
+
+# Simulate coefficient draws from the approximate posterior
+set.seed(444)
+n_draws <- 10000
+beta_draws <- lapply(seq_along(coef_means), function(i) {
+  rnorm(n_draws, mean = coef_means[i], sd = coef_sds[i])
+})
+names(beta_draws) <- names(coef_means)
+
+library(ggplot2)
+library(dplyr)
+
+# Sample a subset of gyms
+selected_gyms <- sample(unique(df_scaled$GymID), 12, replace = FALSE)
+
+# Initialize storage for results and plots
+results_list <- list()
+plot_list <- list()
+
+# Loop through each selected gym
+for (g in seq_along(selected_gyms)) {
+  gym_id <- selected_gyms[g]
+  gym_data <- df_scaled %>% filter(GymID == gym_id)
+  
+  comp <- gym_data$CompetitorIndex_s[1]
+  dens0_1 <- gym_data$Den_0_1_s[1]
+  dens1_4 <- gym_data$Den_1_4_s[1]
+  workforce <- gym_data$GymSiteTypeWorkforce[1]
+  residential <- gym_data$GymSiteTypeResidential[1]
+  parking <- gym_data$GymParkingParking[1]
+  FinalRegion <- gym_data$FinalRegion[1]
+  user_repeat_rate_s <- gym_data$user_repeat_rate_s[1]
+  
+  revenue_sim <- matrix(NA, nrow = length(price_grid), ncol = n_draws)
+  
+  for (i in 1:n_draws) {
+    eta <- beta_draws[["(Intercept)"]][i] +
+      beta_draws[["AvgAccountPayment_s"]][i] * price_scaled +
+      beta_draws[["I(AvgAccountPayment_s^2)"]][i] * price_scaled^2 +
+      beta_draws[["user_repeat_rate_s"]][i] * comp +
+      beta_draws[["AvgAccountPayment_s:GymParkingParking"]][i] * parking * price_scaled +
+      beta_draws[["AvgAccountPayment_s:GymSiteTypeWorkforce"]][i] * workforce * price_scaled +
+      beta_draws[["AvgAccountPayment_s:GymSiteTypeResidential"]][i] * residential * price_scaled
+    
+    predicted_members <- exp(eta)
+    revenue_sim[, i] <- price_grid * predicted_members
+  }
+  
+  revenue_mean <- apply(revenue_sim, 1, mean)
+  revenue_lower <- apply(revenue_sim, 1, quantile, probs = 0.025)
+  revenue_upper <- apply(revenue_sim, 1, quantile, probs = 0.975)
+  
+  df_sim <- data.frame(
+    AvgAccountPayment = price_grid,
+    Revenue_mean = revenue_mean,
+    Revenue_lower = revenue_lower,
+    Revenue_upper = revenue_upper
+  )
+  
+  opt_idx <- which.max(df_sim$Revenue_mean)
+  opt_price <- df_sim$AvgAccountPayment[opt_idx]
+  opt_revenue <- df_sim$Revenue_mean[opt_idx]
+  opt_members <- opt_revenue / opt_price
+  
+  print(paste("Gym", gym_id, "opt_price:", opt_price, "opt_members:", opt_members,
+              "Parking:", parking, "user_repeat_rate_s:", user_repeat_rate_s,
+              "Workforce:", workforce, "Residential:", residential))
+  
+  results_list[[g]] <- data.frame(
+    GymID = gym_id,
+    OptimalPrice = opt_price,
+    OptimalRevenue = opt_revenue,
+    OptimalMembers = opt_members
+  )
+  
+  p <- ggplot(df_sim, aes(x = AvgAccountPayment)) +
+    geom_line(aes(y = Revenue_mean), color = "blue", size = 1) +
+    geom_ribbon(aes(ymin = Revenue_lower, ymax = Revenue_upper), fill = "blue", alpha = 0.2) +
+    geom_vline(xintercept = opt_price, linetype = "dashed", color = "red") +
+    annotate("text", x = 10, y = max(df_sim$Revenue_mean) * 0.95, hjust = 0, size = 4, vjust = 0,
+             label = paste0("£", round(opt_price), ", £", round(opt_revenue), ", ", round(opt_members), " members")) +
+    labs(title = paste(gym_id, "Revenue vs. Price"),
+         x = "Price (£)", y = "Estimated Revenue") +
+    scale_x_continuous(breaks = seq(min(df_sim$AvgAccountPayment), max(df_sim$AvgAccountPayment), by = 5)) +
+    theme_minimal()
+  
+  plot_list[[g]] <- p
+}
+
+# Combine results for all gyms into one data frame
+results_df <- bind_rows(results_list)
+
+# Load plotting library and display plots in a grid
+library(gridExtra)
+grid.arrange(grobs = plot_list[1:12], ncol = 3, nrow = 4)
+
+
+print(summary(lm_model))
+```
+
+
+
